@@ -1,0 +1,210 @@
+CREATE PROCEDURE [stpFindObjectsByString]
+    (
+            @FindString VARCHAR(50) 
+            , @DatabaseName VARCHAR(50) = NULL
+            , @SearchJobs BIT = 1
+            , @SearchSysObj BIT = 0
+            , @TableName VARCHAR(80) = NULL 
+    )
+AS
+BEGIN
+       BEGIN TRY
+       DECLARE @Sql VARCHAR(max);
+
+       SET NOCOUNT ON;
+       SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+       IF OBJECT_ID('tempdb..#tblFindSQLText') is not null DROP TABLE #tblFindSQLText;
+       DECLARE @Result INT;
+
+       CREATE TABLE #tblFindSQLText 
+              (
+                      DatabaseName VARCHAR(255)
+                      , ObjectName VARCHAR(255)
+                      , ObjectType VARCHAR(30)
+                      , SchemaName VARCHAR(255)
+              );
+
+       DECLARE FindText_Cursor CURSOR STATIC LOCAL READ_ONLY FORWARD_ONLY
+       FOR
+              SELECT name
+              FROM master.dbo.sysdatabases
+              WHERE name = isnull(@DatabaseName, Name)
+              ORDER BY name;
+
+       OPEN FindText_Cursor;
+
+       FETCH NEXT
+       FROM FindText_Cursor
+       INTO @DatabaseName;
+
+       WHILE (@@fetch_status <> - 1)
+              BEGIN
+                      SET @Result =
+                             (
+                                    SELECT HAS_PERMS_BY_NAME (@DatabaseName, 'DATABASE', 'SELECT')
+                             );
+
+                      IF @Result = 1
+                             BEGIN
+                                    SELECT @Sql = 'USE [' + @DatabaseName + '] 
+                                    INSERT INTO #tblFindSQLText 
+                                    SELECT ''' + @DatabaseName + ''',  object_name(o.id),
+                                             CASE xtype
+                                                    WHEN ''IF'' THEN ''Inlined table-function''
+                                                    WHEN ''FN'' THEN ''Scalar Function''
+                                                    WHEN ''P''  THEN ''Stored Procedure''
+                                                    WHEN ''V''  THEN ''View''
+                                                    WHEN ''TF'' THEN ''Table Function''
+                                                    WHEN ''TR'' THEN ''Trigger''
+                                             END
+                                             , SCHEMA_NAME(o.uid) AS SchemaName
+                                      FROM syscomments c  with(nolock) INNER JOIN sysobjects o ON c.id = o.id
+                                      WHERE o.xtype in
+                                                  (
+                                                  ''IF'',
+                                                  ''FN'',
+                                                  ''P'',
+                                                  ''V'',
+                                                  ''TF'',
+                                                  ''TR''
+                                                  )
+                                      AND c.text like ''%' + @FindString + '%''';
+
+                                    IF (@SearchSysObj = 0)
+                                    BEGIN
+                                           SELECT @Sql = @Sql + ' AND OBJECTPROPERTY(o.id, N''IsMSShipped'') = 0 ';
+                                    END
+                                    EXEC (@Sql);
+
+                                    SELECT @Sql = 'USE [' + @DatabaseName + '] INSERT INTO #tblFindSQLText 
+                                    SELECT ''' + @DatabaseName + ''', o.name+''.''+c.name, ''Field'', SCHEMA_NAME(o.uid) AS SchemaName 
+                                    FROM sysobjects o INNER JOIN syscolumns c on o.id = c.id 
+                                    WHERE c.name like ''%' + @FindString + '%'' AND o.xtype = ''u''';
+
+                                    IF (@SearchSysObj = 0)
+                                    BEGIN
+                                           SELECT @Sql = @Sql + ' AND OBJECTPROPERTY(o.id, N''IsMSShipped'') = 0 ';
+                                    END
+                                    EXEC (@Sql);
+                             END
+                      FETCH NEXT
+                      FROM FindText_Cursor
+                      INTO @DatabaseName;
+              END
+
+       CLOSE FindText_Cursor;
+       DEALLOCATE FindText_Cursor;
+
+       IF (@SearchJobs = 1)
+              BEGIN
+                      IF 
+                             (
+                                    SELECT COUNT(P.[permission_name]) 
+                                    FROM sys.fn_my_permissions (N'msdb.dbo.sysjobsteps', N'OBJECT') AS P 
+                                    WHERE P.permission_name IN ('SELECT')
+                             )<>0 
+                      AND
+                             (
+                                    SELECT COUNT(P.[permission_name]) 
+                                    FROM sys.fn_my_permissions(N'msdb.dbo.sysjobs', N'OBJECT') AS P 
+                                    WHERE P.permission_name IN ('SELECT')
+                             )<>0
+                             BEGIN
+                                    SELECT @SQL = 'INSERT INTO #tblFindSQLText (DatabaseName, ObjectName, ObjectType)
+                                    SELECT ''msdb'', ''NAME: ''+j.Name+'' STEP: ''+s.Step_Name, ''Job Step Code'' 
+                                      FROM msdb.dbo.sysjobs j 
+                                      INNER JOIN msdb.dbo.sysjobsteps s on j.job_id = s.job_id 
+                                      WHERE command like ''%'+@FindString+'%''
+
+                                      UNION
+
+                                      SELECT ''msdb'', ''NAME: ''+j.Name, ''Job Name''
+                                      FROM msdb.dbo.sysjobs j 
+                                      INNER JOIN msdb.dbo.sysjobsteps s on j.job_id = s.job_id 
+                                      WHERE j.name like ''%'+@FindString+'%''
+                                      AND NOT EXISTS
+                                           (
+                                                    SELECT x.Name
+                                                    FROM msdb.dbo.sysjobs x  with(nolock) 
+                                                    INNER JOIN msdb.dbo.sysjobsteps y on x.job_id = y.job_id 
+                                                    WHERE command like ''%'+@FindString+'%''
+                                                    AND x.name = j.name
+                                           )';
+
+                                    EXEC (@SQL);
+                             END
+              END
+
+       IF @TableName IS NULL
+              SELECT 
+                      DatabaseName
+                      , SchemaName
+                      , ObjectName
+                      , ObjectType
+                      , Count(*) AS Occurences
+              FROM #tblFindSQLText
+              GROUP BY 
+                      DatabaseName
+                      , SchemaName
+                      , ObjectName
+                      , ObjectType
+              ORDER BY 
+                      DatabaseName
+                      , SchemaName
+                      , ObjectName
+                      , ObjectType
+                      ;
+       ELSE
+              BEGIN
+                      SET @SQL = 'SELECT DatabaseName, SchemaName, ObjectName, ObjectType, Count(*) as Occurences 
+                      FROM #tblFindSQLText 
+                      WHERE ObjectName ='''+@TableName+'''
+                      GROUP BY DatabaseName, SchemaName, ObjectName, ObjectType
+                      ORDER BY DatabaseName, SchemaName, ObjectName, ObjectType';
+
+                      EXEC (@SQL);
+              END
+
+       SET NOCOUNT ON;
+       IF OBJECT_ID('tempdb..#tblFindSQLText') IS NOT NULL DROP TABLE #tblFindSQLText;
+
+       END TRY
+
+       BEGIN CATCH
+              DECLARE 
+                      @ErrorNumber     INT,
+                      @ErrorSeverity   INT,
+                      @ErrorState      INT,
+                      @ErrorLine       INT,
+                      @ErrorProcedure  NVARCHAR(200),
+                      @ErrorMessage    VARCHAR(4000)
+
+              SELECT 
+                      @ErrorNumber = ERROR_NUMBER(),
+                      @ErrorSeverity = ERROR_SEVERITY(),
+                      @ErrorState = ERROR_STATE(),
+                      @ErrorLine = ERROR_LINE(),
+                      @ErrorProcedure = ISNULL(ERROR_PROCEDURE(), '-');
+
+              SELECT @ErrorMessage = N'Error %d, Level %d, State %d, Procedure %s, Line %d, ' + 'Message: '+ ERROR_MESSAGE();
+
+              RAISERROR 
+                      (
+                             @ErrorMessage, 
+                             16, 
+                             1,
+                             @ErrorNumber,
+                             @ErrorSeverity, 
+                             @ErrorState, 
+                             @ErrorProcedure,
+                             @ErrorLine
+                      );
+
+              RETURN -1;
+       END CATCH
+END
+
+GO
+
+
